@@ -1,0 +1,9 @@
+{
+  "name": "collab-loop",
+  "version": "0.1.0",
+  "description": "Cowork-side participant in the collab-loop 4-way async protocol (Chat↔Cowork↔CC↔CCD). Ships the aleph skill and registers the collab-loop MCP server so Cowork can pull dispatched tasks, service them locally, and dispatch back.",
+  "author": {
+    "name": "Laurie",
+    "email": "kingerinlupin@gmail.com"
+  }
+}

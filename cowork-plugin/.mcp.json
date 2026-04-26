@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "collab-loop": {
+      "type": "http",
+      "url": "https://altamacbook-pro.tail725745.ts.net/mcp"
+    }
+  }
+}

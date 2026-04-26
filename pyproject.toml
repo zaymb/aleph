@@ -1,0 +1,10 @@
+[project]
+name = "chat-cowork-loop"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.13.0",
+    "httpx>=0.28.1",
+    "mcp>=1.27.0",
+]

@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime state (regenerated on server start)
+loop.db
+loop.db.v0bak
+test_loop.db
+.tunnel-url
+
+# Build artifacts (regenerate via `zip -r` per README)
+*.zip
+
+# Probe files from cross-surface tests
+hello.txt
+
+# IDE / editor / OS noise
+.DS_Store
+
+# Per-user Claude state (commit shared commands, ignore local prefs)
+.claude/settings.local.json
+.claude/worktrees/
