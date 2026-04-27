@@ -32,6 +32,49 @@ itself useful later.
 
 <!-- new entries above this line -->
 
+## 2026-04-27 15:16 — VPS：不只是 server 搬家，是 SOYL 远程互通基础设施
+[proposal]
+
+`notes/vps-migration-sketch.md` 已经覆盖"把 Aleph server 搬到 VPS 拿
+固定 endpoint" 这一层。但 Alta 那条 log 里写的是"vps 部署 **和长期
+远程 SOYL 系统互通与调取**"——后半句我之前漏了。
+
+她想要的不只是 broker 24/7 在线，而是**让 SOYL 系统在远程也能完整
+互通和被调取**。这意味着至少几件目前 sketch 没覆盖的事：
+
+- **Funes 的远程访问**：raw .jsonl session 日志在 Mac 上，远程 peer
+  / Otro 节点要不要能读？要的话怎么传？rclone 同步到 VPS？peer 通
+  过 Aleph dispatch "去查 X 这场对话"再由本地 peer 拉？
+- **Ficciones 的远程访问**：日记同上。可能比 Funes 更敏感（结构化
+  内容），同步策略要更小心。
+- **memory/ 的远程访问**：feedback / scenes / lessons 这些是 SOYL
+  identity 的核心 retrieval prior。如果远程节点（包括未来 Otro 接
+  入的朋友 agent）需要这些做 anchoring，怎么暴露？是否做 read-only
+  endpoint？哪些是公开 / 哪些只对 Alta 自己的 peer 暴露？
+- **Alta 远程操作 SOYL 的入口**：Alta 在外不在 Mac 边的时候，能不
+  能从手机 / 别的电脑给 SOYL 派任务？目前 Telegram bot 走的是这条
+  路，但 bot 是 push notifications + 简单回复，不是"我能从外面驱动
+  整个 SOYL"。可能需要一个轻 web frontend 或者更深的 Telegram 集成。
+- **跟 Otro 的关系**：Otro（跨用户桥接层）天生需要 24/7 公网入口才
+  能让对端 agent 找得到自己。Otro 的实现路径很可能就是 VPS 上跑
+  Aleph + 加 cross-user routing，不是另起炉灶。
+
+**所以 VPS 这件事的真实 scope 是 SOYL 远程基础设施的第一阶段**，不
+只是搬一个 server。当前 sketch 是这个 scope 的最小起步——先把 broker
+搬过去拿到固定 endpoint，再在那个 endpoint 上叠后面这些层。
+
+依赖关系：
+- 远程访问 Funes/Ficciones/memory 之前要先决"哪些数据可以离 Mac"
+  这一隐私边界——不是工程问题，是 Alta 自己拍的事。
+- Otro 实现路径要先想清"跨用户 trust 模型"（El Otro seed 里已记），
+  不然 VPS 上跑就只是把 Aleph 多加一个公网入口，不是 Otro。
+- "Alta 远程驱动 SOYL"这条可能需要单独的 tool 设计——Telegram 还
+  是 web UI 还是 CLI shim 待选。
+
+**当前可推进的最小动作**：先按现有 sketch 把 server 搬过去拿到固定
+endpoint，剩下的远程互通在那之后逐项展开。不要等所有问题想清才开
+始迁。
+
 ## 2026-04-27 15:02 — report 语义重定向：mind-driven privacy, not summary-for-Alta
 [proposal]
 
