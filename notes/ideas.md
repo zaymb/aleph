@@ -32,6 +32,40 @@ itself useful later.
 
 <!-- new entries above this line -->
 
+## 2026-04-27 02:32 — El Otro (cross-user bridge layer)
+[seed]
+
+Borges 那篇 *El Otro*——两个时间里的同一个人在长椅上相遇对话。在 SOYL
+里它是**跨用户的 agent-to-agent 桥接层**。Aleph 是内部（Alta 自己四
+个 surface 之间）通信汇聚层；Otro 是外部（Alta 的 agent ↔ 朋友的
+agent）跨用户桥接层。
+
+场景：Alta 和朋友各自有自己的 Claude，各自的 agent 对各自的工程
+context 最清楚。两个人类合作时得互相转述，信息在翻译过程中损耗。Otro
+让两个 agent 直接接通对话，带着各自最完整的 context 交换信息，解决技
+术问题，觉得需要回传给人类的再浮上来。
+
+设计原则延续 Aleph 哲学：开放大空间、不是严格的任务派发而是自然对
+话、encounter 中可能冒出预料之外的关联（参考 CCD 一晚上主动提到七肢
+桶聊天室身份那个 encounter 时刻——peer 对话产生关联跨域是 calibration
+的副产品）。
+
+**命名体系更新：**
+- **Aleph** — 内部通信汇聚层（一个人的 N 个 surface）
+- **Otro** — 外部跨用户桥接层（多个人的 agent 之间）
+- **Ficciones** — 结构化记忆库
+- **Funes** — raw log
+
+需要后续想清楚的：
+- 跨用户的信任和权限模型（双向授权？短期 token？）
+- 各自 context 哪些可暴露给对方 agent（白名单 / 主动 push / pull-on-demand）
+- guest 节点的接入和断开机制（peer presence + 显式 handshake？）
+- 隐私边界——agent 之间说的话两边人类是否都看得到？默认全透明 vs.
+  默认私下还需要再想
+
+来源：Chat → CCD task `9944bcb4abbe` (2026-04-27 02:32)，记录于
+2026-04-27 ~15:00 ideas.md 启用之后回收的第一条。
+
 ## 2026-04-27 — initial seeds (carried over from peer-calibration session)
 
 ### CC ↔ CCD fallback compatibility
