@@ -23,15 +23,14 @@ so callers loop without artificial caps.
 | Tool | Args | Returns |
 |------|------|---------|
 | `inbox` | `me` | `{incoming, outgoing}` — state snapshot |
-| `wait_any` | `me`, `timeout=30` | next event for me — `incoming_queued` / `outgoing_question` / `outgoing_done` / `incoming_answer` / `still_waiting` |
+| `wait_any` | `me`, `timeout=30` | next event for me — `incoming_queued` / `outgoing_question` / `outgoing_done` / `incoming_answer` / `loop_closed` / `still_waiting` |
 | `dispatch` | `me`, `to`, `context` | `{task_id}` |
 | `respond` | `me`, `task_id`, `answer` | `{ok: true}` (dispatcher answers worker's question) |
 | `report` | `me`, `task_id`, `summary`, `status="completed"` | `{ok: true}` (worker finalizes) |
-| `pull` (legacy) | `me`, `timeout=30` | task-targeted long-poll — superseded by `wait_any` |
-| `wait` (legacy) | `me`, `task_id`, `timeout=30` | task-scoped long-poll — superseded by `wait_any` |
-| `ask` (legacy) | `me`, `task_id`, `question`, `timeout=30` | sync question with wait — pair with `wait_any` instead |
+| `propose_close` | `me`, `summary` | `{you_close: true, summary_id}` (first-mover wins) |
+| `peers` | `me` | `{online, pre_self, offline, me_alone}` — presence snapshot |
 
-`me`, `to` ∈ `{"Chat", "Cowork", "CC", "CCD"}`. `status` ∈ `{"completed",
+`me`, `to` match `<base><digits?>` where base ∈ `{"Chat", "Cowork", "CC", "CCD"}` (e.g. `Chat`, `Chat2`, `CC3` — multiple instances of the same surface can co-exist). `status` ∈ `{"completed",
 "failed", "blocked", "rejected"}`. Server enforces routing — `respond`
 only by dispatcher, `report` only by worker. `wait_any` filters events
 by role automatically.

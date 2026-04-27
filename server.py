@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -27,7 +28,10 @@ from mcp.server.fastmcp import FastMCP
 DB_PATH = os.environ.get("LOOP_DB", os.path.expanduser("~/collab-loop/loop.db"))
 RETENTION_DAYS = int(os.environ.get("LOOP_RETENTION_DAYS", "7"))
 
-VALID_ROLES = ("Chat", "Cowork", "CC", "CCD")
+BASE_ROLES = ("Chat", "Cowork", "CC", "CCD")
+# A role is a base name optionally followed by digits (Chat2, CC3, ...) so
+# multiple instances of the same surface can co-exist in one loop.
+ROLE_PATTERN = re.compile(r"^(Chat|Cowork|CC|CCD)(\d*)$")
 VALID_OUTCOMES = ("completed", "failed", "blocked", "rejected")
 
 # Lower number = higher priority for becoming the loop's "closer".
@@ -35,9 +39,25 @@ VALID_OUTCOMES = ("completed", "failed", "blocked", "rejected")
 # one online becomes responsible for posting the summary; others defer.
 ROLE_PRIORITY = {"Chat": 1, "Cowork": 2, "CCD": 3, "CC": 4}
 
+
+def _base_role(role: str) -> str:
+    m = ROLE_PATTERN.match(role)
+    return m.group(1) if m else role
+
+
+def _close_priority(role: str) -> tuple:
+    """Sort key for closer election: base-priority, then role string for
+    deterministic tie-break between same-base instances (Chat < Chat2)."""
+    return (ROLE_PRIORITY.get(_base_role(role), 99), role)
+
 # How recently a role must have called any tool to count as "online" for
 # closer-eligibility purposes.
 PRESENCE_WINDOW_SEC = 90
+
+# How long a loop_closed summary remains deliverable. Belt-and-suspenders
+# against ghost-summary delivery — even if other safeguards fail, anything
+# older than this TTL is dead.
+LOOP_CLOSE_TTL_SEC = int(os.environ.get("LOOP_CLOSE_TTL_SEC", "3600"))
 
 
 _cond: Optional[asyncio.Condition] = None
@@ -82,6 +102,24 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # presence.segment_started_at migration — add column if missing and
+        # clear stale rows so legacy roles get a fresh segment on next touch
+        # (otherwise old summaries with created_at > legacy default of 0
+        # would still be deliverable).
+        try:
+            with db() as conn:
+                pcols = {row["name"] for row in conn.execute("PRAGMA table_info(presence)")}
+                if pcols and "segment_started_at" not in pcols:
+                    conn.execute(
+                        "ALTER TABLE presence ADD COLUMN "
+                        "segment_started_at REAL NOT NULL DEFAULT 0"
+                    )
+                    conn.execute("DELETE FROM presence")
+                    print("[init] presence schema migrated; cleared stale rows",
+                          file=sys.stderr, flush=True)
+        except sqlite3.OperationalError:
+            pass
+
     with db() as conn:
         conn.executescript(
             """
@@ -111,8 +149,13 @@ def init_db():
                 last_seen_msg_id INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS presence (
-                role         TEXT PRIMARY KEY,
-                last_seen_at REAL NOT NULL
+                role               TEXT PRIMARY KEY,
+                last_seen_at       REAL NOT NULL,
+                -- start of this role's current continuous online segment.
+                -- A gap > PRESENCE_WINDOW_SEC since last touch resets it.
+                -- Used to scope loop_closed delivery to the instance that
+                -- was actually alive when the close happened.
+                segment_started_at REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS loop_summaries (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,8 +201,14 @@ def prune_old_tasks(retention_days: int = RETENTION_DAYS) -> int:
 
 
 def _check_role(me: str) -> Optional[dict]:
-    if me not in VALID_ROLES:
-        return {"ok": False, "error": f"`me` must be one of {VALID_ROLES}, got {me!r}"}
+    if not ROLE_PATTERN.match(me):
+        return {
+            "ok": False,
+            "error": (
+                f"`me` must match <base><digits?> where base is one of "
+                f"{BASE_ROLES} (e.g. Chat, Chat2, CC3); got {me!r}"
+            ),
+        }
     return None
 
 
@@ -199,14 +248,35 @@ def _bump_role_cursor(role: str, msg_id: int):
 
 
 def _touch_presence(role: str):
-    """Record that `role` just called a tool — implicit heartbeat for
-    closer-eligibility computation. Called from every tool entry."""
+    """Mark `role` as just-active. If the prior `last_seen_at` is older
+    than PRESENCE_WINDOW_SEC, this is a brand-new session segment and
+    `segment_started_at` resets to now — so a later instance under the
+    same role is not treated as the same one for loop_closed delivery."""
+    now = time.time()
     with db() as conn:
-        conn.execute(
-            "INSERT INTO presence (role, last_seen_at) VALUES (?, ?) "
-            "ON CONFLICT(role) DO UPDATE SET last_seen_at=excluded.last_seen_at",
-            (role, time.time()),
+        row = conn.execute(
+            "SELECT last_seen_at, segment_started_at FROM presence WHERE role=?",
+            (role,),
+        ).fetchone()
+        is_continuous = (
+            row is not None
+            and row["segment_started_at"] > 0
+            and (now - row["last_seen_at"]) <= PRESENCE_WINDOW_SEC
         )
+        if is_continuous:
+            conn.execute(
+                "UPDATE presence SET last_seen_at=? WHERE role=?",
+                (now, role),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO presence (role, last_seen_at, segment_started_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(role) DO UPDATE SET "
+                "last_seen_at=excluded.last_seen_at, "
+                "segment_started_at=excluded.segment_started_at",
+                (role, now, now),
+            )
 
 
 def _online_roles(now: Optional[float] = None) -> set:
@@ -220,11 +290,30 @@ def _online_roles(now: Optional[float] = None) -> set:
 
 
 def _latest_unseen_close_for(role: str):
-    """Most recent loop_summaries row not yet ack'd by `role`."""
+    """Most recent loop_summaries row deliverable to `role`.
+
+    Eligibility:
+      - role's presence segment started at or before the close (i.e. this
+        instance was alive when the loop closed — not a fresh session
+        wearing the same role label),
+      - role still online within PRESENCE_WINDOW_SEC,
+      - close is within LOOP_CLOSE_TTL_SEC (TTL safety net),
+      - role hasn't ack'd it via last_seen_by, and isn't the closer.
+    """
+    now = time.time()
+    cutoff_ttl = now - LOOP_CLOSE_TTL_SEC
+    cutoff_presence = now - PRESENCE_WINDOW_SEC
     with db() as conn:
         row = conn.execute(
-            "SELECT id, closer, summary, last_seen_by FROM loop_summaries "
-            "ORDER BY created_at DESC LIMIT 1"
+            "SELECT s.id, s.closer, s.summary, s.last_seen_by, s.created_at "
+            "FROM loop_summaries s "
+            "JOIN presence p ON p.role = ? "
+            "WHERE s.created_at >= ? "
+            "  AND p.segment_started_at > 0 "
+            "  AND p.segment_started_at <= s.created_at "
+            "  AND p.last_seen_at >= ? "
+            "ORDER BY s.created_at DESC LIMIT 1",
+            (role, cutoff_ttl, cutoff_presence),
         ).fetchone()
     if not row:
         return None
@@ -301,7 +390,7 @@ Use the same `me` for every call in this session. Never spoof another role.
 | `dispatch` | `me`, `to`, `context` | `{task_id}` |
 | `respond` | `me`, `task_id`, `answer` | `{ok: true}` (dispatcher answers worker's question) |
 | `report` | `me`, `task_id`, `summary`, `status="completed"` | `{ok: true}` (worker finalizes) |
-| `propose_close` | `me`, `summary` | `{you_close: true, summary_id}` or `{you_close: false, defer_to}` |
+| `propose_close` | `me`, `summary` | `{you_close: true, summary_id, higher_priority_online?, note?}` (first-mover wins) |
 | `pull` (legacy) | `me`, `timeout=30` | task-targeted long-poll — superseded by `wait_any` |
 | `wait` (legacy) | `me`, `task_id`, `timeout=30` | task-scoped long-poll — superseded by `wait_any` |
 | `ask` (legacy) | `me`, `task_id`, `question`, `timeout=30` | worker→dispatcher question with synchronous wait — pair with `wait_any` instead |
@@ -329,11 +418,12 @@ arrive. Concurrent dispatcher-of-A + worker-of-B falls out naturally.
 # Loop close (default mode)
 
 When `inbox` is empty AND you've seen ~5 consecutive `still_waiting`,
-call `propose_close(me, summary)`. Server picks the closer by priority
-(Chat > Cowork > CCD > CC). If `you_close: true`, post the full summary
-to Alta. If `you_close: false`, post a one-liner pointing Alta to the
-closer's surface — your `wait_any` will deliver a `loop_closed` event
-shortly with the canonical summary content.
+call `propose_close(me, summary)`. **First-mover wins** — whoever calls
+first persists the summary and closes the loop. Priority (Chat > Cowork
+> CCD > CC) is informational only; if `higher_priority_online` is in
+the response, that's a hint but not a block. Other peers receive a
+`loop_closed` event in their next `wait_any` and post a received-summary
+template pointing to your surface.
 
 `/standby` (or "常驻同步" / "long-term sync") trigger skips this — stay
 in `wait_any` indefinitely without proposing close.
@@ -603,19 +693,24 @@ async def propose_close(me: str, summary: str) -> dict:
       - OR: `peers(me)` shows you are the only role online (everyone
         else dropped) — exit cleanly rather than wait_any forever
 
-    Server picks the closer by priority: Chat > Cowork > CCD > CC. If you
-    are the highest-priority role currently online (presence window 90s,
-    matching PRESENCE_WINDOW_SEC), you become the closer — server
-    persists `summary` and every other role's next `wait_any` will
-    surface it as `{type: "loop_closed", closer, summary}`. If a
-    higher-priority role is online, you defer.
+    First-mover-writes: whoever calls first persists the summary and the
+    loop closes under their name. Other online peers (whose presence
+    segment predates the close) receive a `{type: "loop_closed",
+    closer, summary}` event in their next `wait_any` and exit.
+
+    Priority (Chat > Cowork > CCD > CC) is no longer blocking — peers
+    don't reach the close threshold synchronously, and forcing the
+    first-mover to defer used to drop their summary on the floor. If a
+    higher-priority peer is online, the response includes
+    `higher_priority_online` as a hint, but the summary is still
+    recorded.
 
     Returns:
       - `{ok: true, you_close: true, summary_id}` — you close.
         Post the closer-template message to Alta.
-      - `{ok: true, you_close: false, defer_to, reason}` — defer.
-        Post the deferer-template message to Alta and exit your loop.
-        The `loop_closed` event will arrive in your `wait_any` shortly.
+      - `{ok: true, you_close: true, summary_id, higher_priority_online,
+        note}` — you close, but a higher-priority peer is online; first
+        mover still wins.
       - `{ok: false, error}` — invalid me or empty summary.
     """
     if err := _check_role(me):
@@ -626,21 +721,24 @@ async def propose_close(me: str, summary: str) -> dict:
     if not summary:
         return {"ok": False, "error": "summary cannot be empty"}
 
+    # First-mover-writes: whoever calls propose_close first persists the
+    # summary, regardless of priority. Originally this branch deferred to
+    # higher-priority online peers, but peers don't hit the close
+    # threshold synchronously — forcing the first-mover to defer dropped
+    # their summary and left the loop hanging when the "designated"
+    # closer never reached threshold. See ideas.md Bug A (2026-04-27 16:50).
+    #
+    # `_close_priority` is still computed for the response so the caller
+    # knows whether a higher-priority peer was online — informational, not
+    # blocking. Future "peer-consensus close" (ideas.md option A) can build
+    # on this without re-introducing the silent-drop path.
     online = _online_roles()
-    online.add(me)  # caller is by definition online
-    higher_online = [
-        r for r in online
-        if r != me and ROLE_PRIORITY.get(r, 99) < ROLE_PRIORITY.get(me, 99)
-    ]
-    if higher_online:
-        # Defer to highest-priority among them
-        closer = min(higher_online, key=lambda r: ROLE_PRIORITY.get(r, 99))
-        return {
-            "ok": True,
-            "you_close": False,
-            "defer_to": closer,
-            "reason": f"{closer} is online with higher priority",
-        }
+    online.add(me)
+    me_key = _close_priority(me)
+    higher_online = sorted(
+        (r for r in online if r != me and _close_priority(r) < me_key),
+        key=_close_priority,
+    )
 
     now = time.time()
     with db() as conn:
@@ -651,7 +749,15 @@ async def propose_close(me: str, summary: str) -> dict:
         )
         summary_id = cur.lastrowid
     await notify()
-    return {"ok": True, "you_close": True, "summary_id": summary_id}
+    response = {"ok": True, "you_close": True, "summary_id": summary_id}
+    if higher_online:
+        response["higher_priority_online"] = higher_online
+        response["note"] = (
+            f"first-mover wins: summary recorded under {me}. "
+            f"higher-priority peer(s) {higher_online} online — they will "
+            f"receive loop_closed via wait_any."
+        )
+    return response
 
 
 @mcp.tool()
@@ -664,26 +770,35 @@ async def peers(me: str) -> dict:
         no point holding the loop further; close it).
       - Surfacing presence to Alta ("CC dropped, Chat and CCD still here").
       - Avoiding dispatch to a role that isn't around to service it.
+      - On entry: detecting that another instance of your base role is
+        already in the loop (use `pre_self` — see below — and pick a
+        digit-suffixed role to join as a second seat).
 
     Calling this tool itself touches `me`'s presence, so `me` will always
-    appear in `online`.
+    appear in `online`. `pre_self` is the snapshot taken *before* that
+    touch — that's the field to consult on entry to decide whether your
+    base role is already taken.
 
     Returns:
       {
-        "online":  [role, ...],   # within last 90s
-        "offline": [role, ...],   # all VALID_ROLES not in online
+        "online":   [role, ...],  # within last 90s, after this call
+        "pre_self": [role, ...],  # online snapshot before this call's touch
+        "offline":  [base, ...],  # base roles with no live instance
         "me_alone": bool,         # online == [me]
       }
     """
     if err := _check_role(me):
         return err
+    pre_self = sorted(_online_roles())
     _touch_presence(me)
 
     online = _online_roles()
-    online_list = sorted(r for r in VALID_ROLES if r in online)
-    offline_list = sorted(r for r in VALID_ROLES if r not in online)
+    online_list = sorted(online)
+    live_bases = {_base_role(r) for r in online}
+    offline_list = sorted(b for b in BASE_ROLES if b not in live_bases)
     return {
         "online": online_list,
+        "pre_self": pre_self,
         "offline": offline_list,
         "me_alone": online_list == [me],
     }
@@ -700,7 +815,13 @@ async def dispatch(me: str, to: str, context: str) -> dict:
         return err
     _touch_presence(me)
     if err := _check_role(to):
-        return {"ok": False, "error": f"`to` must be one of {VALID_ROLES}, got {to!r}"}
+        return {
+            "ok": False,
+            "error": (
+                f"`to` must match <base><digits?> where base is one of "
+                f"{BASE_ROLES} (e.g. Chat, Chat2, CC3); got {to!r}"
+            ),
+        }
     if me == to:
         return {"ok": False, "error": "cannot dispatch to self"}
 

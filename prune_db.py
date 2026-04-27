@@ -1,7 +1,8 @@
-"""Prune old completed tasks from loop.db.
+"""Prune old completed tasks and stale loop summaries from loop.db.
 
 Drops tasks (and their messages) where status='done' AND updated_at is
-older than the retention window. Then VACUUMs.
+older than the retention window, plus loop_summaries older than the same
+cutoff. Then VACUUMs.
 
 Usage:
   uv run python prune_db.py                # use LOOP_RETENTION_DAYS or default 7
@@ -87,6 +88,11 @@ def main():
             "DELETE FROM tasks WHERE status='done' AND updated_at < ?",
             (cutoff,),
         )
+        sum_dropped = conn.execute(
+            "DELETE FROM loop_summaries WHERE created_at < ?", (cutoff,),
+        ).rowcount
+        if sum_dropped:
+            print(f"  + {sum_dropped} stale loop_summaries row(s) dropped")
         conn.commit()
     finally:
         conn.close()

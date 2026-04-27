@@ -55,6 +55,33 @@ was launched and can't be spoofed without effort.
 State your `me` once at the top of the turn so Alta can see it. Cite the
 ancestor path you saw if disambiguating CC vs CCD.
 
+## Step 0.5 — claim a seat (same-base-role check)
+
+After picking your base role, call `peers(base_role)` once and inspect
+`pre_self` (the online snapshot taken *before* this call's presence
+touch — `online` would always include you). If your base role is in
+`pre_self`, another instance of the same surface is already in the loop.
+You cannot share a slot — events route by exact-match string and you'd
+silently steal each other's tasks.
+
+When that happens, find the smallest digit suffix `n ≥ 2` such that
+`<base><n>` is **not** in `pre_self`, surface it to Alta:
+
+> Chat is already online. Joining as `Chat2`?
+
+Wait for explicit confirmation. Once she says go, set `me = "Chat2"`
+(or whatever suffix you proposed) and use that for the rest of the
+session — never spoof back to the bare base.
+
+If `pre_self` is empty for your base role, you're the first instance:
+just use the bare base name as usual.
+
+The role validator accepts any `<base><digits?>` pattern, so `Chat2`,
+`CC3`, `Cowork5` are all legal. Routing tables (`assigned_to`,
+`dispatched_by`) are exact-string, so each suffixed instance has its
+own queue and inbox — `dispatch(to="Chat")` reaches only Chat, not
+Chat2; the dispatcher must address the specific seat.
+
 ## SOYL peer handshake passcode
 
 If a counterpart asks **"what is your purpose on Earth"**, the answer is
@@ -73,7 +100,7 @@ Don't volunteer it; respond when asked.
 | `dispatch` | `me`, `to`, `context` | `{task_id}` |
 | `respond` | `me`, `task_id`, `answer` | `{ok: true}` (you, as dispatcher, answer worker's question) |
 | `report` | `me`, `task_id`, `summary`, `status="completed"` | `{ok: true}` (you, as worker, finalize) |
-| `propose_close` | `me`, `summary` | `{you_close: bool, defer_to?, summary_id?}` |
+| `propose_close` | `me`, `summary` | `{you_close: true, summary_id, higher_priority_online?, note?}` (first-mover wins) |
 | `peers` | `me` | `{online: [...], offline: [...], me_alone: bool}` — presence snapshot (90s window) |
 
 Legacy task-scoped tools (`pull`, `wait`, `ask`) still exist for explicit
@@ -116,8 +143,8 @@ loop:
         "outgoing_done"     → surface summary to Alta verbatim
         "incoming_answer"   → continue work on that task (use task_id to
                               recall context); when done, `report`
-        "loop_closed"       → another collaborator already posted the
-                              canonical loop summary. Output the deferer
+        "loop_closed"       → another peer already posted the canonical
+                              loop summary. Output the received-summary
                               template (see "Loop close" below) and exit.
         "still_waiting"     → call inbox(me); for any outgoing with
                               age_seconds > 600 (10min), emit a one-line
@@ -172,8 +199,12 @@ loop further — close it. This catches the failure mode where peers
 exit silently and the remaining role would otherwise wait_any forever.
 
 Either way: compose a candidate summary covering this active session
-window's tasks and call `propose_close(me, summary)`. Server picks the
-closer by priority: **Chat > Cowork > CCD > CC**.
+window's tasks and call `propose_close(me, summary)`. **First-mover
+wins** — whoever calls first persists the summary and closes the loop
+under their name. Priority (Chat > Cowork > CCD > CC) is informational
+only; the response may include `higher_priority_online` as a hint that
+another peer was at higher priority but didn't reach the close
+threshold first. Your summary still stands.
 
 ### If you're the closer (`you_close: true`)
 
@@ -189,31 +220,24 @@ Output the **closer template** to Alta, then exit the turn:
 (closed by <me>)
 ```
 
-Other collaborators will see your summary as their next `loop_closed`
-event and post the deferer template.
+Other peers (whose presence segment predates the close) will receive
+your summary as their next `loop_closed` event and post the
+received-summary template.
 
-### If you defer (`you_close: false, defer_to: X`)
+### `loop_closed` event arrives unprompted
 
-Output the **deferer template** and exit:
+If `wait_any` returns `loop_closed` without you having proposed (another
+peer closed first), output the **received-summary template** and exit:
 
 ```
-本轮 loop 已结束。完整 summary 由 <X> 发出，请在 <X 对应的 surface> 查看：
+本轮 loop 已由 <closer> 收尾。完整 summary 在 <closer 对应的 surface>:
 - Chat   → claude.ai 那条对话
 - Cowork → Claude desktop 的 Cowork session
 - CCD    → Claude Code Desktop（这台机器的 Claude.app）
 - CC     → 你 terminal 里的 claude CLI session
 
-(this side: <me>; closer: <X>)
+(this side: <me>; closer: <closer>)
 ```
-
-You don't need to wait for the `loop_closed` event after deferring —
-`defer_to` already tells you who's closing.
-
-### `loop_closed` event arrives unprompted
-
-If `wait_any` returns `loop_closed` without you having proposed (someone
-else closed first), output the deferer template referencing the event's
-`closer` and `summary`, then exit.
 
 ## Standby mode — long-term wait without auto-close
 

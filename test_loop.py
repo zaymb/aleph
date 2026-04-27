@@ -190,7 +190,7 @@ async def routing_smoke(url: str, log):
                 "dispatch",
                 {"me": "Mobile", "to": "Cowork", "context": "x"},
             ))
-            assert r.get("ok") is False and "must be one of" in r.get("error", ""), r
+            assert r.get("ok") is False and "must match" in r.get("error", ""), r
             log(f"routing: invalid `me` → correctly rejected: {r}")
 
             # self-dispatch
