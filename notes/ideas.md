@@ -32,6 +32,90 @@ itself useful later.
 
 <!-- new entries above this line -->
 
+## 2026-04-27 16:50 — Bug A：propose_close defer 路径丢 summary、不通知 closer
+[proposal]
+
+**具体复现（2026-04-27 16:46–16:50）：**
+1. Cowork 跟 Chat 跑了一场 session，两个 task：bccac7a3d3c6 (16:31)、
+   3e39b1e3c756 (16:43)，都 completed。
+2. Cowork 在两轮交付完成后调 `propose_close(me="Cowork", summary=...)`。
+3. Server 看到 Chat 在线（priority 比 Cowork 高），返回
+   `{ok: true, you_close: false, defer_to: "Chat", reason: "..."}`。
+4. Cowork 收到 defer 后照 SKILL 退出，跟 Alta 说"由 Chat 关闭"。
+5. **Server 在这条 defer 路径上什么都不做**——
+   - `loop_summaries` 表里没新行（grep server.py:638-643 确认）
+   - 没给 Chat 任何 wait_any 事件
+   - Cowork 的 summary 只在 return value 里活了一瞬间，之后丢失
+6. Chat 的 wait_any/inbox 永远等不到 close 事件（也跟 Bug B 叠加，见下）。
+7. Cycle 悬死。
+
+**根因：** propose_close 协议假设了一个 round-table 选举：所有 peer 都
+撞到 close 阈值（5 still_waiting + inbox 空）后各自调 propose_close，
+priority 最高的当选。但实际上 peer 撞阈值的时间不同步，第一个调的可
+能不是 priority 最高的——这种情况下 server 单纯返回 `defer_to: X` 把
+皮球踢给 X，但 X **根本不知道有人想 close 了**。
+
+**修法（待 spec）：**
+
+A. **Defer 时 server 给 designated closer enqueue 一个新事件**——
+   `{type: "close_proposed_by", deferer, draft_summary}`。closer 的
+   wait_any 收到后选择 accept（直接复用 draft_summary，自己只补充）/
+   amend（重写 summary 后调 propose_close）/ reject（这场不该 close）。
+   同时持久化 deferer 的 summary 到一张新表（`close_proposals`）作为
+   草稿，避免丢失。
+
+B. **更激进：** 直接让 deferer 的 propose_close 写 loop_summaries，但
+   把 closer 字段标记为 deferer + designated_closer，效果是"虽然 deferer
+   priority 不够 'official close'，但实际工作已经做完了"。语义上更绕
+   但实现最简。
+
+C. **Client-side workaround**（不改 server）：deferer 收到 defer 后
+   不要直接退出，而是 dispatch 一个 task 给 designated closer 说
+   "请你 propose_close，summary 草案如下"。closer 收到 task 后照办。
+   完全用现有协议实现，但把"close coordination"变成显式的 task。
+
+A 最优雅但最大动作；B 最小代码改动但语义混；C 零 server 改动但把
+工作量推给 SKILL 表述。**lean 偏向 A**——它正面解决"peer 共识 close"
+的语义诉求（参见早前的 seed），不是绕过它。
+
+晋级状态：之前的 [seed] "peer 共识机制 close 前互相征询" 现在有具体
+复现 bug 了，**升级为 [proposal]，与本条合并**。
+
+## 2026-04-27 16:50 — Bug B：Chat 用 inbox poll 而不是 wait_any 接事件
+[seed]
+
+**Chat 自报（task 6407ff224a93）：** 它在 Cowork 那场 session 后没用
+wait_any 而在用 inbox poll。原因——它把 `wait` 跟 `wait_any` 搞混了，
+觉得 `wait` 需要 task_id 而当时没有活跃 outgoing task，于是 fallback
+到 inbox。**但 inbox 只投递 task 状态，根本不投递 `loop_closed` 这
+类 event**。
+
+即便 Bug A 修了（server 正确给 Chat enqueue close 事件），Chat 用
+inbox 也接不到。这是协议层和 SKILL 表述层的混淆失败。
+
+**两层修法：**
+
+1. **SKILL 表述强化**：明确写"event 监听**只能**用 wait_any，inbox
+   是 read-only snapshot 只看任务状态，不接收 loop_closed/incoming
+   _queued/etc"。Step 2 event loop 段开头加一句加粗强调。
+
+2. **协议层去掉 wait/wait_any 命名混淆**：legacy `wait` 工具已经被
+   `wait_any` superseded，但还在协议里悬着，名字相近导致 Chat 误判。
+   两个选项：
+   - **prune**：直接从 `@mcp.tool()` 里去掉 `wait`、`pull`、`ask`，
+     legacy trinity 完全下线。这条本来就跟 5-tool cap workaround 那
+     条 seed 合并——claude.ai 5-tool 限制下我们也容不下这些 legacy。
+   - **rename**：保留功能但 `wait` 改成 `wait_for_task`，跟 `wait_any`
+     从字面分清。
+   
+   prune 更利落。
+
+合并相邻 seed："5-tool cap workaround / prune legacy trinity"
+和"工具命名 refresh"两条早前的 seed 自然落到这条解决路径里——它们
+其实是同一件事的不同切面。
+
+
+
 ## 2026-04-27 15:16 — VPS：不只是 server 搬家，是 SOYL 远程互通基础设施
 [proposal]
 
