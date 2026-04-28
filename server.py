@@ -28,16 +28,17 @@ from mcp.server.fastmcp import FastMCP
 DB_PATH = os.environ.get("LOOP_DB", os.path.expanduser("~/collab-loop/loop.db"))
 RETENTION_DAYS = int(os.environ.get("LOOP_RETENTION_DAYS", "7"))
 
-BASE_ROLES = ("Chat", "Cowork", "CC", "CCD")
+BASE_ROLES = ("Chat", "Cowork", "CC", "CCD", "Human")
 # A role is a base name optionally followed by digits (Chat2, CC3, ...) so
 # multiple instances of the same surface can co-exist in one loop.
-ROLE_PATTERN = re.compile(r"^(Chat|Cowork|CC|CCD)(\d*)$")
+# "Human" is the user herself, participating directly via the dashboard.
+ROLE_PATTERN = re.compile(r"^(Chat|Cowork|CC|CCD|Human)(\d*)$")
 VALID_OUTCOMES = ("completed", "failed", "blocked", "rejected")
 
 # Lower number = higher priority for becoming the loop's "closer".
 # When multiple collaborators idle out at the same time, the highest-priority
 # one online becomes responsible for posting the summary; others defer.
-ROLE_PRIORITY = {"Chat": 1, "Cowork": 2, "CCD": 3, "CC": 4}
+ROLE_PRIORITY = {"Human": 0, "Chat": 1, "Cowork": 2, "CCD": 3, "CC": 4}
 
 
 def _base_role(role: str) -> str:
@@ -156,6 +157,16 @@ def init_db():
                 -- Used to scope loop_closed delivery to the instance that
                 -- was actually alive when the close happened.
                 segment_started_at REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS room (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender     TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS room_cursors (
+                role             TEXT PRIMARY KEY,
+                last_seen_msg_id INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS loop_summaries (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -671,6 +682,18 @@ async def wait_any(me: str, timeout: int = 30) -> dict:
                 # Unknown type — skip (cursor already bumped)
                 continue
 
+        # 3. Room broadcast messages (not from self)
+        room_msgs = _unread_room_msgs(me, limit=1)
+        if room_msgs:
+            rm = room_msgs[0]
+            _bump_room_cursor(me, rm["id"])
+            return {
+                "type": "room_message",
+                "sender": rm["sender"],
+                "content": rm["content"],
+                "msg_id": rm["id"],
+            }
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return {"type": "still_waiting"}
@@ -1076,6 +1099,68 @@ async def report(me: str, task_id: str, summary: str, status: str = "completed")
         )
     await notify()
     return {"ok": True}
+
+
+# ── Room (broadcast channel) ────────────────────────────────────────
+
+def _bump_room_cursor(role: str, msg_id: int):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO room_cursors (role, last_seen_msg_id) VALUES (?, ?) "
+            "ON CONFLICT(role) DO UPDATE SET last_seen_msg_id=excluded.last_seen_msg_id "
+            "WHERE excluded.last_seen_msg_id > room_cursors.last_seen_msg_id",
+            (role, msg_id),
+        )
+
+
+def _unread_room_msgs(role: str, limit: int = 20):
+    with db() as conn:
+        cursor_row = conn.execute(
+            "SELECT last_seen_msg_id FROM room_cursors WHERE role=?", (role,)
+        ).fetchone()
+        after = cursor_row["last_seen_msg_id"] if cursor_row else 0
+        rows = conn.execute(
+            "SELECT id, sender, content, created_at FROM room "
+            "WHERE id > ? ORDER BY id LIMIT ?",
+            (after, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@mcp.tool()
+async def room_send(me: str, content: str) -> dict:
+    """Send a message to the shared room. All peers see it via wait_any
+    (event type 'room_message') or room_read. Broadcast — no 'to' needed."""
+    if err := _check_role(me):
+        return err
+    _touch_presence(me)
+    content = (content or "").strip()
+    if not content:
+        return {"ok": False, "error": "content cannot be empty"}
+    now = time.time()
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO room (sender, content, created_at) VALUES (?, ?, ?)",
+            (me, content, now),
+        )
+        msg_id = cur.lastrowid
+    # Auto-bump sender's cursor so they don't re-read their own message
+    _bump_room_cursor(me, msg_id)
+    await notify()
+    return {"ok": True, "msg_id": msg_id}
+
+
+@mcp.tool()
+async def room_read(me: str, limit: int = 50) -> dict:
+    """Read recent room messages. Returns all messages after your cursor.
+    Cursor auto-advances so you don't re-read."""
+    if err := _check_role(me):
+        return err
+    _touch_presence(me)
+    msgs = _unread_room_msgs(me, limit)
+    if msgs:
+        _bump_room_cursor(me, msgs[-1]["id"])
+    return {"messages": msgs, "count": len(msgs)}
 
 
 def main():

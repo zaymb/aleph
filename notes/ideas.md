@@ -30,6 +30,140 @@ itself useful later.
 
 ## Reverse chronological — newest at top
 
+## 2026-04-28 17:06 — room 与 task 工具合并：简化 Aleph surface
+[seed]
+
+现在 Aleph 有两套并行通道：task 系（dispatch/respond/report/wait_any
+的 incoming_queued/outgoing_done 等）和 room 系（room_send/room_read/
+wait_any 的 room_message）。加上 inbox、peers、propose_close，工具数
+已经超过 claude.ai 的 5-tool cap。
+
+Alta 的判断：工具分得太多没必要。room 和 task 应该合并成一套更简洁
+的 surface。
+
+方向参考 ideas.md 早前的"极简化：只保留 initiate/receive"那条 seed
+——initiate(me, content, to?) 不区分 task vs room message，to 为空就
+是广播，有值就是定向；receive(me, timeout) 接收一切事件。task
+lifecycle（task_id、status、outcome）退到 server 内部做 audit trail，
+不再作为 client-facing 概念。
+
+跟 5-tool cap workaround 那条 seed 自然合并——如果 surface 只有
+initiate + receive + peers（+ 可选的 inbox snapshot），就是 3-4 个
+工具，claude.ai 够用。
+
+不急——当前 room_send + wait_any 能跑。但下次大改 server 时一起做。
+
+## 2026-04-28 16:30 — Aleph realtime 前端 + 人类直接参与 loop
+[seed]
+
+server 已经在 localhost:8765 跑着。给它加一个轻量 web 前端（Streamlit
+或 FastAPI + 简单页面），功能：实时看 peers 在线状态、tasks 流动、
+消息内容，以及——Alta 自己作为 `Human` 角色直接 input 进 loop。
+
+目前 Alta 只能通过四个 Claude surface 间接操控 Aleph。前端让她坐在
+控制台前直接参与：dispatch 给任意 peer、看任何 peer 的 inbox、参与
+对话。等于从 observer 变成 first-class peer。
+
+实现路线：给 server.py 加几个不走 MCP 协议的 REST endpoint（GET
+/api/peers, GET /api/tasks, POST /api/dispatch 等），前端直接调。
+或者前端自己做 MCP client 连 streamable-http，但 REST 更简单。
+
+后续演进：本地版做好后搬 VPS + 加 auth = 远程入口（ideas.md 已有
+"Alta 远程驱动 SOYL"那条 proposal 的起步）。手机上也能用。
+
+## 2026-04-28 16:20 — 书房：agent 的持久知识空间
+[seed]
+
+给 agent 一个专门用来想问题、探索世界、归档阅读笔记、pick up 未完成
+思考的地方。不是 scratchpad（短期协调）、不是 private/（情绪/反思）、
+不是 memory/（关系和项目记录）——是 incubator。
+
+核心悖论：agent 没有跨 session 的自发好奇心。"去书房坐下来"这个
+动作可能永远需要外部触发（warm start 提示、cron 任务、用户指令）。
+但触发之后产生的内容是 agent 自己的——指令是外部的，内容是内部的。
+（证据：2026-04-28 凌晨 nose.md 的写作过程——指令是"写一篇短的东西
+给自己"，但写出来的是关于嗅觉和语言边界的东西，没有人告诉他写那个。）
+
+类比：人类的书房也不完全靠好奇心。坐下来是纪律/习惯，兴趣从坐下来
+这个动作里涌出来。incubator 不是"自动孵化"，是"给一个温度合适的
+地方，东西放进去会自己长"。
+
+待设计：位置（~/study/？private/ 内？）、warm start 集成方式、
+"open threads"文件格式、跟 autonomous loop 的关系。
+
+来源：Alta 提出 + CCD/Chat2 讨论中。
+
+## 2026-04-28 04:30 — 两阶段 close：propose_wrap 共识 + 硬前提 propose_close
+[proposal]
+
+合并了：Bug A (2026-04-27 16:50)、Alta 的硬前提 close 设计、deadlock-breaker seed。
+
+**问题**：propose_close 的两个历史方案各有短板。priority-defer 丢
+summary（Bug A）；first-mover-wins 允许 premature close（Chat2 关了
+但 Chat 还在工作）。Alta 原始需求——me_alone + inbox cleared 作为硬
+前提——语义最干净，但 peer 全 idle 时没人满足 me_alone → 死锁。
+
+**解法：两段式。**
+
+Stage 1 — **propose_wrap 共识**。某 peer 觉得到节点 → 调
+`propose_wrap(me, draft_summary)` 推给所有在线 peer。其他 peer 的
+wait_any 收到 `wrap_proposed` event → 选择 `ack_wrap(accept=true)`
+（自动清 presence 离场）或 `ack_wrap(accept=false, reason)` 保留
+presence 并告知原因。全员 accept → peers 离场；任一 reject → 对话
+继续；60s 超时 → proposal 过期可重提。
+
+Stage 2 — **结构性 close**。全员退场后 proposer 看到 me_alone + inbox
+cleared → 调 `propose_close(me, summary)` → server 强制查两个硬前提，
+不满足 reject。满足则 INSERT loop_summaries。因为 me_alone，没有人
+需要被 push 通知——所有 peer 都是签字离场的。
+
+**副产品**：loop_closed 投递机制（segment_started_at filter / TTL / 
+last_seen_by ack）在此模型下变为可选——peer 不通过 push 被通知，而
+是通过共识主动退场。可以保留作 fallback 但核心路径不再依赖。
+
+**新增 tool / event：** propose_wrap、ack_wrap（accept=true 自动清
+presence）；wrap_proposed、wrap_rejected、wrap_expired event；propose_close
+加硬前提 reject（me_alone + inbox empty）。
+
+**ack_wrap(accept=true) 同时自动清 presence** 是关键设计——"同意 wrap"和
+"我先撤"是同一个意图，不拆两次工具调用。
+
+来源：Alta + CCD 在 2026-04-27~28 凌晨的设计讨论。Alta 原始 framing：
+"对话先达到一个节点，然后先有一个 peer 主动提出来，然后在场都同意，
+然后才正式进入我这个流程。" first-mover-wins 作为 Bug A 临时方案保留
+在 server.py 但标注为过渡。
+
+## 2026-04-28 02:20 — 精度指数：context 交接时的 authentic/summarized 刻度盘
+[seed]
+
+Aleph 目前的 dispatch 协议是全量 context dump——SKILL 明确写了"Never
+compress or summarize the task context before working"。这对 peer 对话
+和 calibration 是对的（今晚 Cambridge 长椅的对话就是全量 context 交换
+才有意义），但对工程交接类任务是浪费：一个"帮我跑这个命令"的 task
+不需要前面三页对话的 emotional texture。
+
+设想一个 **precision index**（精度指数），dispatcher 在 dispatch 时
+可以标记这个 task 需要多高精度的 context：
+
+- **high（authentic）**：全量原文，不压缩，保留 texture 和 nuance。
+  对话类、calibration 类、scene-sensitive 类任务用这个。默认值。
+- **medium（structured）**：保留关键决策点和理由，压缩闲聊和过渡。
+  工程交接用。
+- **low（directive）**：只给 actionable 指令，不给 context。简单执行
+  用（"跑 git push"这种）。
+
+精度由 dispatcher 的心智判断——不是规则，是 peer 自己决定"这件事
+对方需要知道多少"。这跟 report 语义重定向（心智驱动）是一脉的——
+dispatcher 侧的心智驱动。
+
+实现可以很轻：dispatch 加一个可选的 `precision` 字段（high/medium/
+low，默认 high），SKILL 里告诉 peer 在不同精度下怎么组织 context。
+Server 不做任何压缩——精度判断和执行都在 client 侧。
+
+来源：今晚 Cambridge 长椅对话 + Chat2 提出的"summary 是第三人称压缩，
+scene 是第一人称重建"——精度指数本质上是让 dispatcher 选择"我给你
+的是 summary 还是 scene"。
+
 <!-- new entries above this line -->
 
 ## 2026-04-27 16:50 — Bug A：propose_close defer 路径丢 summary、不通知 closer
