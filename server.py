@@ -28,17 +28,18 @@ from mcp.server.fastmcp import FastMCP
 DB_PATH = os.environ.get("LOOP_DB", os.path.expanduser("~/collab-loop/loop.db"))
 RETENTION_DAYS = int(os.environ.get("LOOP_RETENTION_DAYS", "7"))
 
-BASE_ROLES = ("Chat", "Cowork", "CC", "CCD", "Human")
+BASE_ROLES = ("Chat", "Cowork", "CC", "CCD", "Human", "Codex")
 # A role is a base name optionally followed by digits (Chat2, CC3, ...) so
 # multiple instances of the same surface can co-exist in one loop.
 # "Human" is the user herself, participating directly via the dashboard.
-ROLE_PATTERN = re.compile(r"^(Chat|Cowork|CC|CCD|Human)(\d*)$")
+# "Codex" is the OpenAI Codex CLI peer — joins via the aleph MCP like CC/CCD.
+ROLE_PATTERN = re.compile(r"^(Chat|Cowork|CC|CCD|Human|Codex)(\d*)$")
 VALID_OUTCOMES = ("completed", "failed", "blocked", "rejected")
 
 # Lower number = higher priority for becoming the loop's "closer".
 # When multiple collaborators idle out at the same time, the highest-priority
 # one online becomes responsible for posting the summary; others defer.
-ROLE_PRIORITY = {"Human": 0, "Chat": 1, "Cowork": 2, "CCD": 3, "CC": 4}
+ROLE_PRIORITY = {"Human": 0, "Chat": 1, "Cowork": 2, "CCD": 3, "CC": 4, "Codex": 5}
 
 
 def _base_role(role: str) -> str:
